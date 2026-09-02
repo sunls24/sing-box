@@ -1,0 +1,148 @@
+name: Build Small
+
+run-name: Build Small ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version name"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: ${INPUT_VERSION}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    needs:
+      - prepare
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+          cache: false
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-linux-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-linux-
+      - name: Set build tags
+        run: echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_SMALL)" >> "${GITHUB_ENV}"
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' $(cat release/LDFLAGS) -s -w -buildid=" \
+            ./cmd/sing-box
+      - name: Archive
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          DIR_NAME="sing-box-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/${DIR_NAME}"
+          cp LICENSE "dist/${DIR_NAME}/"
+          cp dist/sing-box "dist/${DIR_NAME}/"
+          tar -C dist -czf "dist/${DIR_NAME}.tar.gz" "${DIR_NAME}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  upload:
+    name: Upload builds
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 1
+      - name: Download builds
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Validate release target
+        env:
+          TAG_NAME: v${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+            TAG_COMMIT=$(git rev-list -n 1 "${TAG_NAME}")
+            if [[ "${TAG_COMMIT}" != "${GITHUB_SHA}" ]]; then
+              echo "Tag ${TAG_NAME} points to ${TAG_COMMIT}, not workflow commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
+      - name: Upload release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: v${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/*.tar.gz --clobber
+          elif git show-ref --verify --quiet "refs/tags/${TAG_NAME}"; then
+            gh release create "${TAG_NAME}" dist/*.tar.gz \
+              --verify-tag \
+              --title "${TAG_NAME}" \
+              --draft \
+              --prerelease
+          else
+            gh release create "${TAG_NAME}" dist/*.tar.gz \
+              --target "${GITHUB_SHA}" \
+              --title "${TAG_NAME}" \
+              --draft \
+              --prerelease
+          fi
